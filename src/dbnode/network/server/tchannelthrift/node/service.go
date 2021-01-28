@@ -252,6 +252,9 @@ func (p pools) CheckedBytesWrapper() xpool.CheckedBytesWrapperPool { return p.ch
 type Service interface {
 	rpc.TChanNode
 
+	// FetchTaggedWithResults appends the results to the provided FetchTaggedResults.
+	FetchTaggedWithResults(tctx thrift.Context, req *rpc.FetchTaggedRequest, results FetchTaggedResults) error
+
 	// Only safe to be called one time once the service has started.
 	SetDatabase(db storage.Database) error
 
@@ -264,6 +267,35 @@ type Service interface {
 	// Metadata returns the metadata for the given key and a bool indicating
 	// if it is present.
 	Metadata(key string) (string, bool)
+}
+
+// FetchTaggedResults accumulates the FetchTagged response.
+type FetchTaggedResults interface {
+	// AddResult adds the result for an ID.
+	AddIDResult(result *rpc.FetchTaggedIDResult_)
+
+	// SetSize sets the size of the result set.
+	SetSize(size int)
+
+	// SetExhaustive marks the result set exhaustive.
+	SetExhaustive(exhaustive bool)
+}
+
+// an impl of FetchTaggedResults that accumulates results in the response proto.
+type fetchTaggedResults struct {
+	proto rpc.FetchTaggedResult_
+}
+
+func (f *fetchTaggedResults) AddIDResult(element *rpc.FetchTaggedIDResult_) {
+	f.proto.Elements = append(f.proto.Elements, element)
+}
+
+func (f *fetchTaggedResults) SetSize(size int) {
+	f.proto.Elements = make([]*rpc.FetchTaggedIDResult_, 0, size)
+}
+
+func (f *fetchTaggedResults) SetExhaustive(exhaustive bool) {
+	f.proto.Exhaustive = exhaustive
 }
 
 // NewService creates a new node TChannel Thrift service
@@ -712,9 +744,18 @@ func (s *service) readDatapoints(
 }
 
 func (s *service) FetchTagged(tctx thrift.Context, req *rpc.FetchTaggedRequest) (*rpc.FetchTaggedResult_, error) {
+	results := &fetchTaggedResults{}
+	if err := s.FetchTaggedWithResults(tctx, req, results); err != nil {
+		return nil, err
+	}
+	return &results.proto, nil
+}
+
+func (s *service) FetchTaggedWithResults(tctx thrift.Context, req *rpc.FetchTaggedRequest,
+	results FetchTaggedResults) error {
 	db, err := s.startReadRPCWithDB()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer s.readRPCCompleted()
 
@@ -729,65 +770,83 @@ func (s *service) FetchTagged(tctx thrift.Context, req *rpc.FetchTaggedRequest) 
 		)
 	}
 
-	result, err := s.fetchTagged(ctx, db, req)
+	err = s.fetchTagged(ctx, db, req, results)
 	if sampled && err != nil {
 		sp.LogFields(opentracinglog.Error(err))
 	}
 	sp.Finish()
 
-	return result, err
+	return err
 }
 
-func (s *service) fetchTagged(ctx context.Context, db storage.Database, req *rpc.FetchTaggedRequest) (*rpc.FetchTaggedResult_, error) {
+func (s *service) fetchTagged(ctx context.Context, db storage.Database, req *rpc.FetchTaggedRequest,
+	response FetchTaggedResults) error {
 	callStart := s.nowFn()
 
 	ns, query, opts, fetchData, err := convert.FromRPCFetchTaggedRequest(req, s.pools)
 	if err != nil {
 		s.metrics.fetchTagged.ReportError(s.nowFn().Sub(callStart))
-		return nil, tterrors.NewBadRequestError(err)
+		return tterrors.NewBadRequestError(err)
 	}
 
 	queryResult, err := db.QueryIDs(ctx, ns, query, opts)
 	if err != nil {
 		s.metrics.fetchTagged.ReportError(s.nowFn().Sub(callStart))
-		return nil, convert.ToRPCError(err)
+		return convert.ToRPCError(err)
 	}
 
 	results := queryResult.Results
-	response := &rpc.FetchTaggedResult_{
-		Exhaustive: queryResult.Exhaustive,
-		Elements:   make([]*rpc.FetchTaggedIDResult_, 0, results.Size()),
-	}
+	response.SetSize(results.Size())
+	response.SetExhaustive(queryResult.Exhaustive)
 	nsIDBytes := ns.Bytes()
 
 	// NB(r): Step 1 if reading data then read using an asynchronous block reader,
 	// but don't serialize yet so that all block reader requests can
 	// be issued at once before waiting for their results.
 	var encodedDataResults [][][]xio.BlockReader
+	// TODO: make configurable
+	batchSize := results.Size()
+	batch := make([]index.ResultsMapEntry, 0, batchSize)
+	elements := make([]*rpc.FetchTaggedIDResult_, batchSize)
 	if fetchData {
-		encodedDataResults = make([][][]xio.BlockReader, results.Size())
+		encodedDataResults = make([][][]xio.BlockReader, batchSize)
 	}
-	if err := s.fetchReadEncoded(ctx, db, response, results, ns, nsIDBytes, callStart, opts, fetchData, encodedDataResults); err != nil {
-		s.metrics.fetchTagged.ReportError(s.nowFn().Sub(callStart))
-		return nil, err
-	}
-
-	// Step 2: If fetching data read the results of the asynchronous block readers.
-	if fetchData {
-		if err := s.fetchReadResults(ctx, response, ns, encodedDataResults); err != nil {
-			s.metrics.fetchTagged.ReportError(s.nowFn().Sub(callStart))
-			return nil, err
+	for _, entry := range results.Map().Iter() {
+		batch = append(batch, entry)
+		if len(batch) < batchSize {
+			continue
 		}
+
+		if err := s.fetchReadEncoded(ctx, db, batch, elements, ns, nsIDBytes, callStart, opts, fetchData, encodedDataResults); err != nil {
+			s.metrics.fetchTagged.ReportError(s.nowFn().Sub(callStart))
+			return err
+		}
+
+		// Step 2: If fetching data read the results of the asynchronous block readers.
+		if fetchData {
+			if err := s.fetchReadResults(ctx, elements, ns, encodedDataResults); err != nil {
+				s.metrics.fetchTagged.ReportError(s.nowFn().Sub(callStart))
+				return err
+			}
+			encodedDataResults = make([][][]xio.BlockReader, batchSize)
+		}
+
+		for _, element := range elements {
+			response.AddIDResult(element)
+		}
+
+		batch = make([]index.ResultsMapEntry, 0, batchSize)
+		elements = make([]*rpc.FetchTaggedIDResult_, batchSize)
 	}
 
 	s.metrics.fetchTagged.ReportSuccess(s.nowFn().Sub(callStart))
-	return response, nil
+	return nil
 }
 
 func (s *service) fetchReadEncoded(ctx context.Context,
 	db storage.Database,
-	response *rpc.FetchTaggedResult_,
-	results index.QueryResults,
+	batch []index.ResultsMapEntry,
+	elements []*rpc.FetchTaggedIDResult_,
 	nsID ident.ID,
 	nsIDBytes []byte,
 	callStart time.Time,
@@ -808,7 +867,7 @@ func (s *service) fetchReadEncoded(ctx context.Context,
 	// Re-use reader and id for more memory-efficient processing of
 	// tags from doc.Metadata
 	reader := docs.NewEncodedDocumentReader()
-	for _, entry := range results.Map().Iter() {
+	for _, entry := range batch {
 		idx := i
 		i++
 
@@ -836,7 +895,7 @@ func (s *service) fetchReadEncoded(ctx context.Context,
 			ID:          id.Bytes(),
 			EncodedTags: encodedTags.Bytes(),
 		}
-		response.Elements = append(response.Elements, elem)
+		elements[idx] = elem
 		if !fetchData {
 			continue
 		}
@@ -854,7 +913,7 @@ func (s *service) fetchReadEncoded(ctx context.Context,
 
 func (s *service) fetchReadResults(
 	ctx context.Context,
-	response *rpc.FetchTaggedResult_,
+	elements []*rpc.FetchTaggedIDResult_,
 	nsID ident.ID,
 	encodedDataResults [][][]xio.BlockReader,
 ) error {
@@ -862,18 +921,18 @@ func (s *service) fetchReadResults(
 	if sampled {
 		sp.LogFields(
 			opentracinglog.String("id", nsID.String()),
-			opentracinglog.Int("elementCount", len(response.Elements)),
+			opentracinglog.Int("elementCount", len(elements)),
 		)
 	}
 	defer sp.Finish()
 
-	for idx := range response.Elements {
+	for idx := range elements {
 		segments, rpcErr := s.readEncodedResult(ctx, encodedDataResults[idx])
 		if rpcErr != nil {
 			return rpcErr
 		}
 
-		response.Elements[idx].Segments = segments
+		elements[idx].Segments = segments
 	}
 	return nil
 }
