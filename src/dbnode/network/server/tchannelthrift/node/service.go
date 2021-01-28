@@ -744,6 +744,7 @@ func (s *service) readDatapoints(
 }
 
 func (s *service) FetchTagged(tctx thrift.Context, req *rpc.FetchTaggedRequest) (*rpc.FetchTaggedResult_, error) {
+	// TODO: make this impl configurable
 	results := &fetchTaggedResults{}
 	if err := s.FetchTaggedWithResults(tctx, req, results); err != nil {
 		return nil, err
