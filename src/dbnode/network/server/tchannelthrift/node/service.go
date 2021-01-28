@@ -31,6 +31,7 @@ import (
 
 	"github.com/m3db/m3/src/dbnode/client"
 	"github.com/m3db/m3/src/dbnode/generated/thrift/rpc"
+	"github.com/m3db/m3/src/dbnode/namespace"
 	"github.com/m3db/m3/src/dbnode/network/server/tchannelthrift"
 	"github.com/m3db/m3/src/dbnode/network/server/tchannelthrift/convert"
 	tterrors "github.com/m3db/m3/src/dbnode/network/server/tchannelthrift/errors"
@@ -58,7 +59,6 @@ import (
 	xtime "github.com/m3db/m3/src/x/time"
 
 	apachethrift "github.com/apache/thrift/lib/go/thrift"
-	"github.com/m3db/m3/src/dbnode/namespace"
 	opentracinglog "github.com/opentracing/opentracing-go/log"
 	"github.com/uber-go/tally"
 	"github.com/uber/tchannel-go/thrift"
@@ -271,8 +271,8 @@ type Service interface {
 
 // FetchTaggedResults accumulates the FetchTagged response.
 type FetchTaggedResults interface {
-	// AddResult adds the result for an ID.
-	AddIDResult(result *rpc.FetchTaggedIDResult_)
+	// AddResults adds the set of ID results.
+	AddIDResults(results []*rpc.FetchTaggedIDResult_)
 
 	// SetSize sets the size of the result set.
 	SetSize(size int)
@@ -286,8 +286,8 @@ type fetchTaggedResults struct {
 	proto rpc.FetchTaggedResult_
 }
 
-func (f *fetchTaggedResults) AddIDResult(element *rpc.FetchTaggedIDResult_) {
-	f.proto.Elements = append(f.proto.Elements, element)
+func (f *fetchTaggedResults) AddIDResults(elements []*rpc.FetchTaggedIDResult_) {
+	f.proto.Elements = append(f.proto.Elements, elements...)
 }
 
 func (f *fetchTaggedResults) SetSize(size int) {
@@ -832,9 +832,7 @@ func (s *service) fetchTagged(ctx context.Context, db storage.Database, req *rpc
 			encodedDataResults = make([][][]xio.BlockReader, batchSize)
 		}
 
-		for _, element := range elements {
-			response.AddIDResult(element)
-		}
+		response.AddIDResults(elements)
 
 		batch = make([]index.ResultsMapEntry, 0, batchSize)
 		elements = make([]*rpc.FetchTaggedIDResult_, batchSize)
