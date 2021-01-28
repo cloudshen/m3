@@ -807,16 +807,22 @@ func (s *service) fetchTagged(ctx context.Context, db storage.Database, req *rpc
 	var encodedDataResults [][][]xio.BlockReader
 	// TODO: make configurable
 	batchSize := results.Size()
+	// set the capacity of the slices to the maximum batch size.
 	batch := make([]index.ResultsMapEntry, 0, batchSize)
 	elements := make([]*rpc.FetchTaggedIDResult_, batchSize)
 	if fetchData {
 		encodedDataResults = make([][][]xio.BlockReader, batchSize)
 	}
+	processed := 0
 	for _, entry := range results.Map().Iter() { //nolint: gocritic
+		processed++
 		batch = append(batch, entry)
-		if len(batch) < batchSize {
+		// TODO: add a test for multiple iterations (batch size < results size)
+		if len(batch) < batchSize && processed < results.Size() {
 			continue
 		}
+		// reset the slice for the new batch
+		elements = elements[:len(batch)]
 
 		err := s.fetchReadEncoded(ctx, db, batch, elements, ns, nsIDBytes, callStart, opts, fetchData,
 			encodedDataResults)
@@ -827,17 +833,17 @@ func (s *service) fetchTagged(ctx context.Context, db storage.Database, req *rpc
 
 		// Step 2: If fetching data read the results of the asynchronous block readers.
 		if fetchData {
+			// reset the slice for the new batch
+			encodedDataResults = encodedDataResults[:len(batch)]
 			if err := s.fetchReadResults(ctx, elements, ns, encodedDataResults); err != nil {
 				s.metrics.fetchTagged.ReportError(s.nowFn().Sub(callStart))
 				return err
 			}
-			encodedDataResults = make([][][]xio.BlockReader, batchSize)
 		}
 
 		response.AddIDResults(elements)
-
-		batch = make([]index.ResultsMapEntry, 0, batchSize)
-		elements = make([]*rpc.FetchTaggedIDResult_, batchSize)
+		// reset the batch for the next iteration.
+		batch = batch[:0]
 	}
 
 	s.metrics.fetchTagged.ReportSuccess(s.nowFn().Sub(callStart))
