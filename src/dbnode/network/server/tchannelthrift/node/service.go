@@ -812,13 +812,15 @@ func (s *service) fetchTagged(ctx context.Context, db storage.Database, req *rpc
 	if fetchData {
 		encodedDataResults = make([][][]xio.BlockReader, batchSize)
 	}
-	for _, entry := range results.Map().Iter() {
+	for _, entry := range results.Map().Iter() { //nolint: gocritic
 		batch = append(batch, entry)
 		if len(batch) < batchSize {
 			continue
 		}
 
-		if err := s.fetchReadEncoded(ctx, db, batch, elements, ns, nsIDBytes, callStart, opts, fetchData, encodedDataResults); err != nil {
+		err := s.fetchReadEncoded(ctx, db, batch, elements, ns, nsIDBytes, callStart, opts, fetchData,
+			encodedDataResults)
+		if err != nil {
 			s.metrics.fetchTagged.ReportError(s.nowFn().Sub(callStart))
 			return err
 		}
@@ -866,7 +868,7 @@ func (s *service) fetchReadEncoded(ctx context.Context,
 	// Re-use reader and id for more memory-efficient processing of
 	// tags from doc.Metadata
 	reader := docs.NewEncodedDocumentReader()
-	for _, entry := range batch {
+	for _, entry := range batch { //nolint: gocritic
 		idx := i
 		i++
 
